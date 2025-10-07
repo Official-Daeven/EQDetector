@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PHIVOLCS Earthquake Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    transition: background 0.3s, color 0.3s;
+  }
+  #map { height: 60vh; transition: filter 0.3s; }
+  .list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px;
+    background: #fff;
+    transition: background 0.3s, color 0.3s;
+  }
+  .quake {
+    padding: 8px;
+    border-bottom: 1px solid #ddd;
+    cursor: pointer;
+    transition: background 0.3s;
+  }
+  .quake:hover { background: #f0f0f0; }
+  .quake.active { background: #007bff; color: white; }
+  .label { font-size: 11px; color: gray; }
+  .topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #007bff;
+    color: white;
+    padding: 10px;
+    font-weight: bold;
+    flex-wrap: wrap;
+  }
+  .toggle {
+    background: white;
+    color: #007bff;
+    border: none;
+    border-radius: 5px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+  #lastUpdated {
+    width: 100%;
+    text-align: center;
+    font-size: 12px;
+    color: #eee;
+    margin-top: 5px;
+    opacity: 0.9;
+    cursor: pointer;
+  }
+
+  /* Spinner */
+  .spinner {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    padding: 30px;
+  }
+  .spinner div {
+    width: 12px;
+    height: 12px;
+    margin: 3px;
+    background: #007bff;
+    border-radius: 50%;
+    animation: bounce 0.6s infinite alternate;
+  }
+  .spinner div:nth-child(2) { animation-delay: 0.2s; }
+  .spinner div:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes bounce {
+    to { transform: translateY(-10px); opacity: 0.6; }
+  }
+
+  /* Dark Mode */
+  body.dark { background: #1e1e1e; color: #ddd; }
+  body.dark .list { background: #2c2c2c; color: #ddd; }
+  body.dark .quake:hover { background: #3a3a3a; }
+  body.dark .quake.active { background: #2196f3; }
+  body.dark .spinner div { background: #66b3ff; }
+  body.dark #lastUpdated { color: #aaa; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div>🌏 PHIVOLCS Earthquake Map</div>
+  <button class="toggle" id="themeToggle">🌙 Dark</button>
+  <div id="lastUpdated" title="Tap to view exact time">Last updated: --</div>
+</div>
+<div id="map"></div>
+<div class="list" id="quakeList"><div class="spinner"><div></div><div></div><div></div></div></div>
+
+<audio id="alertSound" src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" preload="auto"></audio>
+
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([12.8797, 121.7740], 6);
+let lightLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+let darkLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { attribution: '© OpenStreetMap, © CartoDB' });
+
+const themeToggle = document.getElementById('themeToggle');
+const alertSound = document.getElementById('alertSound');
+const listDiv = document.getElementById('quakeList');
+const lastUpdatedDiv = document.getElementById('lastUpdated');
+let markers = [];
+let lastFirstTime = null;
+let isDark = false;
+let lastUpdateTime = null;
+
+// THEME
+const storedTheme = localStorage.getItem('theme');
+const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+if (storedTheme === 'dark' || (!storedTheme && prefersDark)) enableDarkMode(); else disableDarkMode();
+themeToggle.onclick = () => { isDark ? disableDarkMode() : enableDarkMode(); };
+function enableDarkMode() { isDark = true; document.body.classList.add('dark'); map.removeLayer(lightLayer); darkLayer.addTo(map); themeToggle.textContent = '☀️ Light'; localStorage.setItem('theme', 'dark'); }
+function disableDarkMode() { isDark = false; document.body.classList.remove('dark'); map.removeLayer(darkLayer); lightLayer.addTo(map); themeToggle.textContent = '🌙 Dark'; localStorage.setItem('theme', 'light'); }
+
+// FETCH
+async function fetchEarthquakes(url) {
+  const proxy = "https://corsproxy.io/?" + encodeURIComponent(url);
+  const res = await fetch(proxy);
+  const html = await res.text();
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+  const rows = Array.from(doc.querySelectorAll('table tbody tr'));
+  const quakes = [];
+  rows.forEach(row => {
+    const cells = row.querySelectorAll('td');
+    if (cells.length >= 6) {
+      quakes.push({
+        time: cells[0].innerText.trim(),
+        latitude: parseFloat(cells[1].innerText),
+        longitude: parseFloat(cells[2].innerText),
+        depth: cells[3].innerText.trim(),
+        magnitude: parseFloat(cells[4].innerText),
+        place: cells[5].innerText.trim()
+      });
+    }
+  });
+  return quakes;
+}
+
+function getMarkerColor(mag, type) {
+  if (type === "live") return mag >= 6 ? "red" : mag >= 4 ? "orange" : "blue";
+  if (type === "history") return mag >= 6 ? "purple" : mag >= 4 ? "green" : "gray";
+}
+
+function renderQuakes(allQuakes, showAlert = false) {
+  listDiv.innerHTML = "";
+  markers.forEach(m => map.removeLayer(m));
+  markers = [];
+
+  allQuakes.forEach((q, i) => {
+    const div = document.createElement('div');
+    div.className = 'quake';
+    div.innerHTML = `<b>${q.magnitude}</b> | ${q.place}<br><small>${q.time}</small> <span class="label">(${q.type})</span>`;
+    listDiv.appendChild(div);
+
+    const marker = L.circleMarker([q.latitude, q.longitude], {
+      radius: 6,
+      color: getMarkerColor(q.magnitude, q.type),
+      fillColor: getMarkerColor(q.magnitude, q.type),
+      fillOpacity: 0.8
+    }).addTo(map)
+      .bindPopup(`<b>${q.place}</b><br>${q.time}<br>Magnitude: ${q.magnitude}<br><i>${q.type}</i>`);
+    markers.push(marker);
+
+    div.onclick = () => {
+      map.setView([q.latitude, q.longitude], 8, { animate: true });
+      markers.forEach(m => m.setStyle({ radius: 6 }));
+      marker.setStyle({ radius: 10 });
+      document.querySelectorAll('.quake').forEach(e => e.classList.remove('active'));
+      div.classList.add('active');
+      marker.openPopup();
+    };
+    marker.on('click', () => {
+      document.querySelectorAll('.quake').forEach(e => e.classList.remove('active'));
+      div.classList.add('active');
+      div.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  });
+
+  if (showAlert && allQuakes.length > 0) {
+    const newestLive = allQuakes.find(q => q.type === "live");
+    if (newestLive && lastFirstTime && newestLive.time !== lastFirstTime) {
+      alertSound.play();
+      alert(`⚠️ New earthquake detected!\n${newestLive.place}\nMagnitude: ${newestLive.magnitude}`);
+    }
+    if (newestLive) lastFirstTime = newestLive.time;
+  } else if (!lastFirstTime && allQuakes.length > 0) {
+    const newestLive = allQuakes.find(q => q.type === "live");
+    if (newestLive) lastFirstTime = newestLive.time;
+  }
+}
+
+async function loadBoth(showAlert = false) {
+  listDiv.innerHTML = `<div class="spinner"><div></div><div></div><div></div></div>`;
+  const [live, history] = await Promise.all([
+    fetchEarthquakes("https://earthquake.phivolcs.dost.gov.ph/"),
+    fetchEarthquakes("https://earthquake.phivolcs.dost.gov.ph/earthquake/")
+  ]);
+  const all = [...live.map(q => ({ ...q, type: "live" })), ...history.map(q => ({ ...q, type: "history" }))];
+  all.sort((a, b) => new Date(b.time) - new Date(a.time));
+
+  lastUpdateTime = new Date();
+  updateTimeLabel();
+  renderQuakes(all, showAlert);
+}
+
+// UPDATE TIME LABEL
+function updateTimeLabel() {
+  if (!lastUpdateTime) return;
+  const now = new Date();
+  const diffMs = now - lastUpdateTime;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffSecs = Math.floor(diffMs / 1000);
+  let text;
+  if (diffMins >= 60) text = `Last updated ${Math.floor(diffMins / 60)} hr(s) ago`;
+  else if (diffMins >= 1) text = `Last updated ${diffMins} min(s) ago`;
+  else text = `Last updated ${diffSecs} sec(s) ago`;
+  lastUpdatedDiv.textContent = text;
+}
+
+// Show exact update time when clicked
+lastUpdatedDiv.onclick = () => {
+  if (lastUpdateTime) {
+    const exact = lastUpdateTime.toLocaleString();
+    alert(`⏰ Exact last update: ${exact}`);
+  }
+};
+
+setInterval(updateTimeLabel, 30000);
+setInterval(() => loadBoth(true), 60000);
+loadBoth();
+</script>
+</body>
+</html>
